@@ -338,4 +338,5 @@ Limitations are stated once, precisely:
 Storage Fabric is developed by Summon Software Labs.
 
 ## License
+
 Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
