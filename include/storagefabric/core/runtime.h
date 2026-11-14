@@ -163,6 +163,7 @@ private:
     std::unordered_map<BlobId, ContentDigest> blob_digest_;
     std::unordered_map<BlobId, std::uint64_t> blob_refs_;
     std::unordered_map<BlobId, std::uint64_t> blob_sizes_;
+    std::unordered_map<BlobId, StorageBackendId> blob_backend_;   // backend holding each blob
 
     // Id counters (monotonic, restored from persistence).
     std::uint64_t backend_counter_{1};

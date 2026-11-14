@@ -51,6 +51,15 @@ ContentDigest compute_manifest_digest(const Manifest& m) {
     return out;
 }
 
+// A replica set's authoritative count covers only its authoritative replicas
+// (a moved-from copy stays listed but is no longer authoritative).
+void refresh_replica_counts(ReplicaSet& rs) {
+    rs.actual = static_cast<std::uint32_t>(rs.replicas.size());
+    std::uint32_t auth = 0;
+    for (const auto& rp : rs.replicas) if (rp.authoritative) ++auth;
+    rs.authoritative_replicas = auth;
+}
+
 }  // namespace
 
 // ---- id allocators ----
@@ -299,6 +308,9 @@ Result<PlacementRecord> StorageFabric::publish_to(const ObjectDescriptor& obj, B
     if (content.size() != obj.logical_size) {
         return Result<PlacementRecord>::failure(StatusCode::LengthMismatch, "content size mismatch");
     }
+    // Publication mutates the catalog, blob index, manifests and placements that
+    // read/verify/evict/save/recover access under the same lock.
+    std::lock_guard<std::mutex> lock(mutex_);
     const AuthorityEnvelope auth = opts.authority.is_nil() ? authority_ : opts.authority;
     if (auth.is_nil()) return Result<PlacementRecord>::failure(StatusCode::InvalidArgument, "no authority set");
     // Authority fencing: a mutation under a strictly OLDER authority than the live
@@ -338,7 +350,13 @@ Result<PlacementRecord> StorageFabric::publish_to(const ObjectDescriptor& obj, B
         // dedup check
         BlobId bid;
         auto it = blob_by_digest_.find(d);
-        if (it != blob_by_digest_.end() && opts.dedupe) {
+        // Dedup only onto a live blob held by this same backend: a placement's
+        // chunks are read from its own backend.
+        const bool reuse = opts.dedupe && it != blob_by_digest_.end() &&
+                           blob_refs_.count(it->second) != 0 &&
+                           blob_backend_.count(it->second) != 0 &&
+                           blob_backend_.at(it->second) == backend_id;
+        if (reuse) {
             bid = it->second;
             ++blob_refs_[bid];
             accounting_.deduplicated_bytes += len;   // content-addressed dedup saved these bytes
@@ -351,6 +369,7 @@ Result<PlacementRecord> StorageFabric::publish_to(const ObjectDescriptor& obj, B
             blob_sizes_[bid] = len;
             blob_refs_[bid] = 1;
             blob_by_digest_[d] = bid;
+            blob_backend_[bid] = backend_id;
             ++accounting_.physical_blobs;
             accounting_.physical_bytes += len;
         }
@@ -443,8 +462,7 @@ Result<PlacementRecord> StorageFabric::publish_to(const ObjectDescriptor& obj, B
         ri.authoritative = true;
         entry.replica_set.replicas.push_back(std::move(ri));
     }
-    entry.replica_set.actual = static_cast<std::uint32_t>(entry.replica_set.replicas.size());
-    entry.replica_set.authoritative_replicas = static_cast<std::uint32_t>(entry.replica_set.replicas.size());
+    refresh_replica_counts(entry.replica_set);
     std::uint32_t domains = 0; std::set<std::string> dset;
     for (const auto& rp : entry.replica_set.replicas) { if (dset.insert(rp.failure_domain).second) ++domains; }
     entry.replica_set.distinct_failure_domains = domains;
@@ -594,6 +612,14 @@ Result<PlacementRecord> StorageFabric::move(const PlacementRecord& source, Stora
     std::lock_guard<std::mutex> guard(mutex_);
     auto it = placements_.find(source.id);
     if (it != placements_.end()) it->second.lifecycle = PlacementLifecycle::STALE;
+    // ...and its replica, so it no longer counts toward durability.
+    if (auto* ep = get_entry(source.object)) {
+        for (auto& rp : ep->replica_set.replicas) {
+            if (rp.id == source.replica) { rp.authoritative = false; rp.state = ReplicaState::STALE; }
+        }
+        refresh_replica_counts(ep->replica_set);
+        ep->replica_set.state = ep->replica_set.compute_state();
+    }
     return rep;
 }
 
@@ -622,7 +648,10 @@ Result<EvictionDecision> StorageFabric::evict(PlacementId placement) {
     std::uint64_t freed = 0;
     EvictionDecision decision;
     std::vector<BlobId> blob_ids;
+    std::vector<BlobId> reclaimed;
     {
+        // The checks and the state change happen under one lock: two evictions
+        // must not both pass the durability check (or both release the blobs).
         std::lock_guard<std::mutex> guard(mutex_);
         auto it = placements_.find(placement);
         if (it == placements_.end()) return EvictionDecision{false, "placement not found", StatusCode::NotFound};
@@ -642,45 +671,51 @@ Result<EvictionDecision> StorageFabric::evict(PlacementId placement) {
         auto mit = manifests_.find(p.manifest);
         if (mit != manifests_.end()) { for (const auto& c : mit->second.chunks) blob_ids.push_back(c.blob); }
         decision = EvictionDecision{true, "eviction completed", StatusCode::Ok};
-    }
-    // IO outside the global lock.
-    auto be_res = get_backend(bid);
-    if (be_res.ok()) be_res.value()->remove("placements/placement-" + placement.str());
-    {
-        std::lock_guard<std::mutex> guard(mutex_);
-        auto it = placements_.find(placement);
-        if (it != placements_.end()) {
-            it->second.lifecycle = PlacementLifecycle::EVICTED;
-            it->second.freshness = Freshness::STALE;
-            if (accounting_.active_placements > 0) --accounting_.active_placements;
-            ++accounting_.evicted_bytes;
-        }
-        // Decrement blob refcounts; reclaim a physical blob when no references remain.
+
+        it->second.lifecycle = PlacementLifecycle::EVICTED;
+        it->second.freshness = Freshness::STALE;
+        if (accounting_.active_placements > 0) --accounting_.active_placements;
+        ++accounting_.evicted_bytes;
+        // Decrement blob refcounts; reclaim a physical blob when no references
+        // remain (and drop it from the dedup index so nothing dedups onto it).
         for (const auto& b : blob_ids) {
             auto rit = blob_refs_.find(b);
             if (rit != blob_refs_.end()) {
                 if (rit->second > 0) --rit->second;
                 if (rit->second == 0) {
-                    if (be_res.ok()) be_res.value()->remove(blob_key(b));
+                    reclaimed.push_back(b);
                     blob_refs_.erase(rit);
+                    auto dit = blob_digest_.find(b);
+                    if (dit != blob_digest_.end()) {
+                        auto iit = blob_by_digest_.find(dit->second);
+                        if (iit != blob_by_digest_.end() && iit->second == b) blob_by_digest_.erase(iit);
+                        blob_digest_.erase(dit);
+                    }
+                    blob_sizes_.erase(b);
+                    blob_backend_.erase(b);
                 }
             }
         }
         // Drop the replica from the replica set so authoritative count is accurate.
-        auto* ep = get_entry(p.object);
-        if (ep) {
-            auto& reps = ep->replica_set.replicas;
+        auto* ep2 = get_entry(p.object);
+        if (ep2) {
+            auto& reps = ep2->replica_set.replicas;
             for (auto rp = reps.begin(); rp != reps.end(); ++rp) {
                 if (rp->id == p.replica) { reps.erase(rp); break; }
             }
-            ep->replica_set.actual = static_cast<std::uint32_t>(reps.size());
-            ep->replica_set.authoritative_replicas = static_cast<std::uint32_t>(reps.size());
+            refresh_replica_counts(ep2->replica_set);
             std::uint32_t dom = 0; std::set<std::string> dset;
             for (const auto& rp : reps) { if (dset.insert(rp.failure_domain).second) ++dom; }
-            ep->replica_set.distinct_failure_domains = dom;
-            ep->replica_set.state = ep->replica_set.compute_state();
+            ep2->replica_set.distinct_failure_domains = dom;
+            ep2->replica_set.state = ep2->replica_set.compute_state();
         }
         reservations_.remove_committed(bid, freed);
+    }
+    // Backend IO outside the global lock.
+    auto be_res = get_backend(bid);
+    if (be_res.ok()) {
+        be_res.value()->remove("placements/placement-" + placement.str());
+        for (const auto& b : reclaimed) be_res.value()->remove(blob_key(b));
     }
     return decision;
 }
@@ -755,17 +790,40 @@ Status StorageFabric::recover(const std::filesystem::path& path) {
     for (const auto& b : snap.backends) backend_descriptors_.emplace(b.id, b);
     accounting_ = snap.accounting;
 
-    // Rebuild blob refcounts and dedup index from persisted chunk digests.
-    for (const auto& m : manifests_) {
-        for (const auto& c : m.second.chunks) {
+    // Rebuild blob refcounts and the dedup index from the chunks of the placements
+    // that still hold them (an evicted placement's blobs may be gone); each blob
+    // lives on its placement's backend.
+    for (const auto& pk : placements_) {
+        const PlacementRecord& pl = pk.second;
+        if (pl.lifecycle == PlacementLifecycle::EVICTED) continue;
+        auto mit = manifests_.find(pl.manifest);
+        if (mit == manifests_.end()) continue;
+        for (const auto& c : mit->second.chunks) {
             blob_digest_[c.blob] = c.digest;
             blob_sizes_[c.blob] = c.physical_length;
             blob_by_digest_[c.digest] = c.blob;
+            blob_backend_[c.blob] = pl.backend;
             ++blob_refs_[c.blob];
         }
     }
-    for (const auto& r : blob_refs_) {
-        if (r.first.value() >= blob_counter_) blob_counter_ = r.first.value() + 1;
+    // Ids issued after recovery must not collide with recovered ones.
+    for (const auto& m : manifests_) {
+        if (m.first.value() >= manifest_counter_) manifest_counter_ = m.first.value() + 1;
+        for (const auto& c : m.second.chunks) {
+            if (c.blob.value() >= blob_counter_) blob_counter_ = c.blob.value() + 1;
+        }
+    }
+    for (const auto& o : snap.objects) {
+        if (o.id.value() >= object_counter_) object_counter_ = o.id.value() + 1;
+    }
+    for (const auto& pl : snap.placements) {
+        if (pl.id.value() >= placement_counter_) placement_counter_ = pl.id.value() + 1;
+        if (pl.replica.value() >= replica_counter_) replica_counter_ = pl.replica.value() + 1;
+    }
+    for (const auto& rs : snap.replica_sets) {
+        for (const auto& rp : rs.replicas) {
+            if (rp.id.value() >= replica_counter_) replica_counter_ = rp.id.value() + 1;
+        }
     }
 
     // Live process authority is cleared: start a fresh epoch/authority.
